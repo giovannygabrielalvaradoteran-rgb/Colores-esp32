@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Detector de Color - LEDs</title>
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body { background:#121212; color:#fff; font-family:Arial,sans-serif; margin:0; padding:16px;
+           display:flex; flex-direction:column; align-items:center; text-align:center; user-select:none; }
+    h1 { font-size:1.2rem; margin:4px 0 12px; }
+    .btn { background:#007BFF; color:#fff; border:none; padding:14px 22px; font-size:1rem; font-weight:bold;
+           border-radius:12px; margin:6px; cursor:pointer; }
+    .btn-connect { background:#28a745; }
+    .btn-connect.connected { background:#dc3545; }
+    .btn:disabled { opacity:.4; }
+    #camBox { position:relative; width:100%; max-width:420px; aspect-ratio:4/3; background:#000;
+              border-radius:12px; overflow:hidden; margin-top:10px; }
+    #video { width:100%; height:100%; object-fit:cover; }
+    #reticle { position:absolute; left:50%; top:50%; width:90px; height:90px; margin:-45px 0 0 -45px;
+               border:3px solid #fff; border-radius:8px; box-shadow:0 0 0 2000px rgba(0,0,0,.35); }
+    #detected { margin-top:14px; font-size:1.6rem; font-weight:bold; }
+    #swatch { width:70px; height:30px; border-radius:6px; margin:8px auto; border:2px solid #444; }
+    #rgb { color:#888; font-size:.85rem; }
+    #status { color:#aaa; margin-top:10px; font-size:.9rem; min-height:20px; }
+    .hint { color:#666; font-size:.8rem; margin-top:14px; max-width:420px; }
+  </style>
+</head>
+<body>
+  <h1>🎨 Detector de Color → LEDs</h1>
+
+  <div>
+    <button id="connectBtn" class="btn btn-connect">Conectar ESP32</button>
+    <button id="camBtn" class="btn">Activar cámara</button>
+  </div>
+  <div id="status">Desconectado</div>
+
+  <div id="camBox">
+    <video id="video" playsinline muted autoplay></video>
+    <div id="reticle"></div>
+  </div>
+  <canvas id="canvas" width="160" height="120" style="display:none"></canvas>
+
+  <div id="detected">Color: —</div>
+  <div id="swatch"></div>
+  <div id="rgb">RGB: —</div>
+
+  <div class="hint">
+    Apuntá el cuadro blanco al objeto. Detecta <b>rojo</b>, <b>azul</b> y <b>blanco</b>.
+    Solo funciona en Chrome/Edge para Android (HTTPS).
+  </div>
+
+  <script>
+    // ⚠️ Deben coincidir con los bloques BLE del ESP32.
+    const urlParams = new URLSearchParams(window.location.search);
+    const BLE_DEVICE_NAME_PREFIX = urlParams.get('nombre') || 'ESP32-BLE';
+    const SERVICE_UUID = 0x181A;
+    const CHAR_UUID = 0x2A6E;
+
+    let deviceBLE = null, txChar = null;
+    const connectBtn = document.getElementById('connectBtn');
+    const camBtn = document.getElementById('camBtn');
+    const statusText = document.getElementById('status');
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const detectedDiv = document.getElementById('detected');
+    const swatch = document.getElementById('swatch');
+    const rgbDiv = document.getElementById('rgb');
+
+    statusText.innerText = 'Buscando: ' + BLE_DEVICE_NAME_PREFIX + (BLE_DEVICE_NAME_PREFIX === 'ESP32-BLE' ? ' (cualquiera)' : '');
+
+    // ---- BLE (misma lógica de las otras apps) ----
+    connectBtn.addEventListener('click', async () => {
+      if (deviceBLE && deviceBLE.gatt.connected) { deviceBLE.gatt.disconnect(); return; }
+      if (!navigator.bluetooth) { statusText.innerText = 'Este navegador no soporta Web Bluetooth.'; return; }
+      try {
+        statusText.innerText = 'Buscando ESP32...';
+        deviceBLE = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: BLE_DEVICE_NAME_PREFIX }], optionalServices: [SERVICE_UUID]
+        });
+        const server = await deviceBLE.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        txChar = await service.getCharacteristic(CHAR_UUID);
+        statusText.innerText = '¡Conectado!';
+        connectBtn.innerText = 'Desconectar';
+        connectBtn.classList.add('connected');
+        lastSent = null; // fuerza a reenviar el color actual
+        deviceBLE.addEventListener('gattserverdisconnected', () => {
+          statusText.innerText = 'Desconectado';
+          connectBtn.innerText = 'Conectar ESP32';
+          connectBtn.classList.remove('connected');
+          txChar = null;
+        });
+      } catch (e) {
+        console.error(e);
+        statusText.innerText = 'Error de conexión: ' + e.message;
+      }
+    });
+
+    async function sendCmd(cmd) {
+      if (!txChar) return;
+      try { await txChar.writeValue(new TextEncoder().encode(cmd)); console.log('Enviado: ' + cmd); }
+      catch (e) { console.error('Error enviando:', e); }
+    }
+
+    // ---- Cámara ----
+    camBtn.addEventListener('click', async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+        camBtn.disabled = true;
+        setInterval(analizarFrame, 100);
+      } catch (e) {
+        console.error(e);
+        statusText.innerText = 'No se pudo abrir la cámara: ' + e.message;
+      }
+    });
+
+    // ---- Detección de color ----
+    function clasificar(r, g, b) {
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      const v = max / 255;
+      const s = max === 0 ? 0 : (max - min) / max;
+      let h = 0;
+      if (max !== min) {
+        const d = max - min;
+        if (max === r) h = ((g - b) / d) % 6;
+        else if (max === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h *= 60; if (h < 0) h += 360;
+      }
+      if (v > 0.75 && s < 0.18) return 'W';                          // blanco: muy claro y poco saturado
+      if (s > 0.45 && v > 0.25) {
+        if (h < 15 || h > 345) return 'R';                           // rojo
+        if (h >= 195 && h <= 255) return 'B';                        // azul
+      }
+      return 'N';                                                    // ninguno
+    }
+
+    const NOMBRES = { R: 'ROJO', B: 'AZUL', W: 'BLANCO', N: 'Ninguno' };
+    let candidato = 'N', repeticiones = 0, estable = 'N', lastSent = null;
+
+    function analizarFrame() {
+      if (video.readyState < 2) return;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      // zona central de 40x40 px (equivale al cuadro blanco de la pantalla)
+      const data = ctx.getImageData(60, 40, 40, 40).data;
+      let r = 0, g = 0, b = 0, n = data.length / 4;
+      for (let i = 0; i < data.length; i += 4) { r += data[i]; g += data[i + 1]; b += data[i + 2]; }
+      r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
+
+      swatch.style.background = `rgb(${r},${g},${b})`;
+      rgbDiv.innerText = `RGB: ${r}, ${g}, ${b}`;
+
+      // Filtro anti-parpadeo: el color debe repetirse 3 lecturas seguidas para cambiar
+      const c = clasificar(r, g, b);
+      if (c === candidato) repeticiones++; else { candidato = c; repeticiones = 1; }
+      if (repeticiones >= 3 && candidato !== estable) estable = candidato;
+
+      detectedDiv.innerText = 'Color: ' + NOMBRES[estable];
+      if (estable !== lastSent) { sendCmd(estable); lastSent = estable; }
+    }
+  </script>
+</body>
+</html>
